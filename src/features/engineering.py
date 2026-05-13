@@ -1,0 +1,311 @@
+"""Feature engineering for the store-sales time-series forecasting project."""
+
+from typing import List
+
+import numpy as np
+import pandas as pd
+
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_GROUP_KEYS: List[str] = ["store_nbr", "family"]
+_LAG_DAYS: List[int] = [7, 14, 28]
+_ROLL_WINDOWS: List[int] = [7, 14, 28]
+
+
+# ── Private helpers ──────────────────────────────────────────────────────────
+
+def _add_store_features(df: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFrame:
+    """Merge store type and cluster from the stores metadata table.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Main DataFrame indexed on (store_nbr, family, date).
+    stores : pd.DataFrame
+        Stores metadata with columns store_nbr, type, city, state, cluster.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns ``store_type`` and ``cluster``.
+    """
+    store_meta = (
+        stores[["store_nbr", "type", "cluster"]]
+        .rename(columns={"type": "store_type"})
+    )
+    return df.merge(store_meta, on="store_nbr", how="left")
+
+
+def _add_oil_features(df: pd.DataFrame, oil: pd.DataFrame) -> pd.DataFrame:
+    """Merge daily oil price and its 7-day lag into the feature matrix.
+
+    The lag is computed on the oil DataFrame directly (date-level signal) so
+    the shift is applied in strict calendar order, independent of the
+    (store_nbr, family) expansion.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Main DataFrame with a ``date`` column.
+    oil : pd.DataFrame
+        Oil price table with columns date and dcoilwtico (already forward-filled).
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns ``dcoilwtico`` and ``oil_lag_7``.
+    """
+    oil_feats = oil[["date", "dcoilwtico"]].copy().sort_values("date")
+    oil_feats["oil_lag_7"] = oil_feats["dcoilwtico"].shift(7)
+    return df.merge(oil_feats, on="date", how="left")
+
+
+def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Extract calendar components from the ``date`` column.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain a ``date`` column of dtype datetime64.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns: day_of_week, month, day_of_month,
+        week_of_year, is_weekend, quincena.
+    """
+    dt = df["date"].dt
+    df["day_of_week"] = dt.dayofweek.astype(np.int8)       # 0=Mon … 6=Sun
+    df["month"] = dt.month.astype(np.int8)
+    df["day_of_month"] = dt.day.astype(np.int8)
+    df["week_of_year"] = dt.isocalendar().week.astype(np.int8)
+    df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(np.int8)
+    df["quincena"] = np.where(df["day_of_month"] <= 15, 1, 2).astype(np.int8)
+    return df
+
+
+def _add_holiday_features(df: pd.DataFrame, holidays: pd.DataFrame) -> pd.DataFrame:
+    """Add holiday indicator, locale, and distance-to-holiday features.
+
+    Only rows where ``transferred == False`` and ``type != 'Work Day'`` are
+    treated as actual holidays. Multiple holidays on the same date are
+    deduplicated, keeping the first (typically the national-level one).
+
+    Distance features use binary search (``np.searchsorted``) so no Python
+    loops are needed regardless of dataset size.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain a ``date`` column of dtype datetime64.
+    holidays : pd.DataFrame
+        Raw holidays_events table from Kaggle.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns: is_holiday (int8), holiday_locale (str),
+        days_to_next_holiday (int), days_since_last_holiday (int).
+    """
+    real_holidays = (
+        holidays
+        .query("type != 'Work Day' and transferred == False")
+        [["date", "locale"]]
+        .drop_duplicates(subset="date", keep="first")
+        .rename(columns={"locale": "holiday_locale"})
+        .assign(is_holiday=np.int8(1))
+    )
+
+    df = df.merge(real_holidays, on="date", how="left")
+    df["is_holiday"] = df["is_holiday"].fillna(0).astype(np.int8)
+    df["holiday_locale"] = df["holiday_locale"].fillna("None")
+
+    # Vectorised distance features via binary search
+    holiday_dates = np.sort(real_holidays["date"].values)
+    date_vals = df["date"].values
+    n = len(holiday_dates)
+
+    idx_next = np.searchsorted(holiday_dates, date_vals, side="left")
+
+    has_next = idx_next < n
+    days_to_next = np.where(
+        has_next,
+        (holiday_dates[np.minimum(idx_next, n - 1)] - date_vals)
+        .astype("timedelta64[D]")
+        .astype(np.int16),
+        np.int16(999),
+    )
+
+    idx_prev = idx_next - 1
+    has_prev = idx_prev >= 0
+    days_since_last = np.where(
+        has_prev,
+        (date_vals - holiday_dates[np.maximum(idx_prev, 0)])
+        .astype("timedelta64[D]")
+        .astype(np.int16),
+        np.int16(999),
+    )
+
+    df["days_to_next_holiday"] = days_to_next
+    df["days_since_last_holiday"] = days_since_last
+    return df
+
+
+def _add_promotion_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add current and lagged promotion count per (store_nbr, family).
+
+    The 7-day lag is applied within each (store_nbr, family) group so that
+    the shift honours series boundaries rather than row position.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns store_nbr, family, and onpromotion. Must be
+        sorted by (store_nbr, family, date) before calling.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new column ``onpromotion_lag_7``.
+    """
+    df["onpromotion_lag_7"] = (
+        df.groupby(_GROUP_KEYS, sort=False)["onpromotion"].shift(7)
+    )
+    return df
+
+
+def _add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add lagged sales features per (store_nbr, family).
+
+    Lags are applied after ``sales`` has already been log1p-transformed so
+    that lag features and the target share the same scale, which is
+    appropriate for RMSLE optimisation.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns store_nbr, family, and sales. Must be sorted by
+        (store_nbr, family, date) before calling.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns sales_lag_7, sales_lag_14, sales_lag_28.
+    """
+    group = df.groupby(_GROUP_KEYS, sort=False)["sales"]
+    for lag in _LAG_DAYS:
+        df[f"sales_lag_{lag}"] = group.shift(lag)
+    return df
+
+
+def _add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add rolling mean and std of sales per (store_nbr, family).
+
+    Windows are computed on sales shifted by 1 (i.e. ending at t-1) to
+    prevent any data leakage from the current observation.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns store_nbr, family, and sales. Must be sorted by
+        (store_nbr, family, date) before calling.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns sales_roll_mean_{7,14,28} and
+        sales_roll_std_{7,14,28}.
+    """
+    group = df.groupby(_GROUP_KEYS, sort=False)["sales"]
+    for window in _ROLL_WINDOWS:
+        df[f"sales_roll_mean_{window}"] = group.transform(
+            lambda x, w=window: x.shift(1).rolling(w, min_periods=1).mean()
+        )
+        df[f"sales_roll_std_{window}"] = group.transform(
+            lambda x, w=window: x.shift(1).rolling(w, min_periods=1).std()
+        )
+    return df
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+def build_features(
+    df: pd.DataFrame,
+    stores: pd.DataFrame,
+    oil: pd.DataFrame,
+    holidays: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build the full feature matrix for training or inference.
+
+    Applies all feature groups in the correct order:
+
+    1. Sort by (store_nbr, family, date) — mandatory before any lag/roll.
+    2. Store metadata (type, cluster).
+    3. Oil price and its 7-day lag (date-level join).
+    4. Calendar decomposition.
+    5. Holiday indicator, locale, and distance features.
+    6. Promotion current + 7-day lag.
+    7. log1p transform on ``sales`` (when present).
+    8. Lag features on log1p(sales): t-7, t-14, t-28.
+    9. Rolling mean and std on log1p(sales): 7-, 14-, 28-day windows.
+
+    Log1p is applied before lags and rolling stats so that all sales-derived
+    features share the same scale as the target, which is appropriate for a
+    model optimised on RMSLE.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw train or test DataFrame loaded by ``load_raw_data()``. Expected
+        columns: id, date, store_nbr, family, sales (train only), onpromotion.
+    stores : pd.DataFrame
+        Stores metadata table (store_nbr, type, city, state, cluster).
+    oil : pd.DataFrame
+        Oil price table (date, dcoilwtico) with forward-filled missing values.
+    holidays : pd.DataFrame
+        Holidays and events table (date, type, locale, transferred, …).
+
+    Returns
+    -------
+    pd.DataFrame
+        Feature matrix sorted by (store_nbr, family, date) with all engineered
+        columns appended. The ``sales`` column — when present — is returned in
+        log1p space. NaN values in lag / rolling columns are expected for the
+        earliest dates in each series and must be handled downstream
+        (e.g. dropped during training or imputed).
+
+    Notes
+    -----
+    The input DataFrames are never mutated; all operations work on copies.
+
+    Examples
+    --------
+    >>> from src.data.loader import load_raw_data
+    >>> from src.features.engineering import build_features
+    >>> data = load_raw_data()
+    >>> feat = build_features(
+    ...     data["train"], data["stores"], data["oil"], data["holidays"]
+    ... )
+    >>> feat.shape[1] > data["train"].shape[1]
+    True
+    """
+    out = df.copy()
+
+    # Step 1 — canonical sort order; all group-aware operations rely on this
+    out = out.sort_values([*_GROUP_KEYS, "date"]).reset_index(drop=True)
+
+    # Steps 2–6 — joins and deterministic transforms (order-independent)
+    out = _add_store_features(out, stores)
+    out = _add_oil_features(out, oil)
+    out = _add_calendar_features(out)
+    out = _add_holiday_features(out, holidays)
+    out = _add_promotion_features(out)
+
+    # Steps 7–9 — sales-derived features; only available on train-like data
+    if "sales" in out.columns:
+        out["sales"] = np.log1p(out["sales"])
+        out = _add_lag_features(out)
+        out = _add_rolling_features(out)
+
+    return out
