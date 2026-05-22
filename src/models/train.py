@@ -55,14 +55,14 @@ LGBM_PARAMS: Dict = {
     "bagging_fraction":  0.8,
     "bagging_freq":      5,
     "min_child_samples": 20,
-    "n_estimators":      1_000,
+    "n_estimators":      3_000,
     "random_state":      42,
     "n_jobs":            -1,
     "verbose":           -1,
 }
 
 MLFLOW_EXPERIMENT: str = "store-sales-forecasting"
-MODEL_FILENAME:    str = "lgbm_baseline.joblib"
+MODEL_FILENAME:    str = "lgbm_v3.joblib"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -103,6 +103,10 @@ def load_and_build_features() -> pd.DataFrame:
     split, then drops warmup rows — rows whose lag features are NaN because
     they fall within the first 28 days of each (store_nbr, family) series.
 
+    The temporal cutoff is computed before calling ``build_features`` so that
+    target-encoding means are derived exclusively from the training window,
+    preventing any leakage from the validation period.
+
     Returns
     -------
     pd.DataFrame
@@ -112,12 +116,18 @@ def load_and_build_features() -> pd.DataFrame:
     print("Loading raw data …")
     data = load_raw_data()
 
+    # Raw slice covering only the training window — used for target encoding
+    cutoff = data["train"]["date"].max() - pd.Timedelta(days=VAL_DAYS - 1)
+    raw_train = data["train"].loc[data["train"]["date"] < cutoff]
+
     print("\nBuilding features …")
     feat = build_features(
-        df       = data["train"],
-        stores   = data["stores"],
-        oil      = data["oil"],
-        holidays = data["holidays"],
+        df           = data["train"],
+        stores       = data["stores"],
+        oil          = data["oil"],
+        holidays     = data["holidays"],
+        transactions = data["transactions"],
+        train_df     = raw_train,
     )
 
     n_before = len(feat)
@@ -309,7 +319,7 @@ def main() -> None:
     # ── 4–5. Train and evaluate ────────────────────────────────────────────
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name="lgbm_baseline"):
+    with mlflow.start_run(run_name="lgbm_v3_target_encoding"):
 
         model = train_model(train_df, val_df, feature_cols)
         rmsle_val = evaluate(model, val_df, feature_cols)

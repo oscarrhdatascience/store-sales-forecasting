@@ -228,6 +228,169 @@ def _add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _add_transactions_features(
+    df: pd.DataFrame,
+    transactions: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Merge store-level transaction counts and add lag and rolling features.
+
+    Transaction signals are computed at the (store_nbr, date) level before
+    merging so that the shift honours strict calendar ordering within each
+    store, independent of the (store_nbr, family) expansion in *df*.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Main DataFrame with columns store_nbr and date.
+    transactions : pd.DataFrame or None
+        Daily transaction counts with columns store_nbr, date, transactions.
+        When None, returns ``df`` unchanged (inference mode where transaction
+        data is unavailable).
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns ``transactions``, ``transactions_lag_7``, and
+        ``transactions_roll_mean_7``. When *transactions* is None, returns the
+        input unchanged.
+    """
+    if transactions is None:
+        return df
+
+    tx = (
+        transactions[["store_nbr", "date", "transactions"]]
+        .copy()
+        .sort_values(["store_nbr", "date"])
+    )
+    store_grp = tx.groupby("store_nbr", sort=False)["transactions"]
+    tx["transactions_lag_7"] = store_grp.shift(7)
+    tx["transactions_roll_mean_7"] = store_grp.transform(
+        lambda x: x.shift(1).rolling(7, min_periods=1).mean()
+    )
+    return df.merge(
+        tx[["store_nbr", "date", "transactions",
+            "transactions_lag_7", "transactions_roll_mean_7"]],
+        on=["store_nbr", "date"],
+        how="left",
+    )
+
+
+def _add_earthquake_feature(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a binary flag for the 2016 Ecuador earthquake recovery period.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain a ``date`` column of dtype datetime64.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new column ``is_earthquake_period`` (int8): 1 for dates
+        between 2016-04-16 and 2016-05-16 inclusive, 0 otherwise.
+    """
+    _QUAKE_START = pd.Timestamp("2016-04-16")
+    _QUAKE_END = pd.Timestamp("2016-05-16")
+    df["is_earthquake_period"] = (
+        (df["date"] >= _QUAKE_START) & (df["date"] <= _QUAKE_END)
+    ).astype(np.int8)
+    return df
+
+
+def _add_fourier_features(
+    df: pd.DataFrame,
+    period: float,
+    n_terms: int,
+    prefix: str,
+) -> pd.DataFrame:
+    """Add sine and cosine Fourier terms to capture cyclic seasonality.
+
+    The time index is the number of elapsed days from ``date.min()``, so the
+    Fourier phase is dataset-relative and does not depend on calendar year.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain a ``date`` column of dtype datetime64.
+    period : float
+        Length of the seasonal cycle in days (e.g. 7.0 for weekly,
+        365.25 for annual).
+    n_terms : int
+        Number of Fourier harmonics to include. Produces 2 * n_terms columns.
+    prefix : str
+        Column name prefix; e.g. ``"weekly"`` yields ``weekly_sin_1``,
+        ``weekly_cos_1``, …, ``weekly_sin_n``, ``weekly_cos_n``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with 2 * n_terms new float columns appended.
+    """
+    t = (df["date"] - df["date"].min()).dt.days.to_numpy(dtype=np.float64)
+    for k in range(1, n_terms + 1):
+        angle = 2.0 * np.pi * k * t / period
+        df[f"{prefix}_sin_{k}"] = np.sin(angle)
+        df[f"{prefix}_cos_{k}"] = np.cos(angle)
+    return df
+
+
+def _add_target_encoding(
+    df: pd.DataFrame,
+    train_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Add mean-sales target encoding per family, store, and (store, family).
+
+    Means are computed exclusively from *train_df* to prevent leakage from the
+    validation or test period. The ``sales`` column in *train_df* is
+    log1p-transformed internally so the encoded features are on the same scale
+    as the target. Unseen combinations at inference time receive the global
+    mean computed from *train_df*.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Main feature matrix to augment. Must contain columns family and
+        store_nbr.
+    train_df : pd.DataFrame or None
+        Raw training-period DataFrame with columns family, store_nbr, and
+        sales (in original scale). When None, returns ``df`` unchanged.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with new columns ``family_mean_sales``, ``store_mean_sales``,
+        and ``store_family_mean_sales``.
+    """
+    if train_df is None:
+        return df
+
+    enc = train_df[["family", "store_nbr"]].copy()
+    enc["sales_log1p"] = np.log1p(train_df["sales"].values)
+    global_mean: float = enc["sales_log1p"].mean()
+
+    family_mean = (
+        enc.groupby("family")["sales_log1p"].mean().rename("family_mean_sales")
+    )
+    store_mean = (
+        enc.groupby("store_nbr")["sales_log1p"].mean().rename("store_mean_sales")
+    )
+    store_family_mean = (
+        enc.groupby(["store_nbr", "family"])["sales_log1p"]
+        .mean()
+        .rename("store_family_mean_sales")
+    )
+
+    df = df.merge(family_mean, on="family", how="left")
+    df = df.merge(store_mean, on="store_nbr", how="left")
+    df = df.merge(store_family_mean, on=["store_nbr", "family"], how="left")
+
+    df["family_mean_sales"] = df["family_mean_sales"].fillna(global_mean)
+    df["store_mean_sales"] = df["store_mean_sales"].fillna(global_mean)
+    df["store_family_mean_sales"] = df["store_family_mean_sales"].fillna(global_mean)
+
+    return df
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def build_features(
@@ -235,20 +398,29 @@ def build_features(
     stores: pd.DataFrame,
     oil: pd.DataFrame,
     holidays: pd.DataFrame,
+    transactions: pd.DataFrame | None = None,
+    train_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build the full feature matrix for training or inference.
 
     Applies all feature groups in the correct order:
 
-    1. Sort by (store_nbr, family, date) — mandatory before any lag/roll.
-    2. Store metadata (type, cluster).
-    3. Oil price and its 7-day lag (date-level join).
-    4. Calendar decomposition.
-    5. Holiday indicator, locale, and distance features.
-    6. Promotion current + 7-day lag.
-    7. log1p transform on ``sales`` (when present).
-    8. Lag features on log1p(sales): t-7, t-14, t-28.
-    9. Rolling mean and std on log1p(sales): 7-, 14-, 28-day windows.
+    1.  Sort by (store_nbr, family, date) — mandatory before any lag/roll.
+    2.  Store metadata (type, cluster).
+    3.  Oil price and its 7-day lag (date-level join).
+    4.  Calendar decomposition.
+    5.  Holiday indicator, locale, and distance features.
+    6.  Promotion current + 7-day lag.
+    7.  Transaction count, 7-day lag, 7-day rolling mean (skipped when
+        *transactions* is None).
+    8.  Earthquake recovery period flag (2016-04-16 – 2016-05-16).
+    9.  Weekly Fourier terms (period=7, n_terms=3).
+    10. Annual Fourier terms (period=365.25, n_terms=6).
+    11. Target encoding — mean log1p(sales) per family, store, and
+        (store, family) derived from *train_df* only (skipped when None).
+    12. log1p transform on ``sales`` (when present).
+    13. Lag features on log1p(sales): t-7, t-14, t-28.
+    14. Rolling mean and std on log1p(sales): 7-, 14-, 28-day windows.
 
     Log1p is applied before lags and rolling stats so that all sales-derived
     features share the same scale as the target, which is appropriate for a
@@ -265,6 +437,15 @@ def build_features(
         Oil price table (date, dcoilwtico) with forward-filled missing values.
     holidays : pd.DataFrame
         Holidays and events table (date, type, locale, transferred, …).
+    transactions : pd.DataFrame or None, optional
+        Daily transaction counts (store_nbr, date, transactions). When None
+        (default), transaction features are skipped — suitable for inference
+        where this signal is unavailable.
+    train_df : pd.DataFrame or None, optional
+        Raw training-period DataFrame (family, store_nbr, sales in original
+        scale) used exclusively to compute target-encoding means. Must cover
+        only the training window (no validation or test rows) to prevent
+        leakage. When None (default), target encoding is skipped.
 
     Returns
     -------
@@ -302,7 +483,14 @@ def build_features(
     out = _add_holiday_features(out, holidays)
     out = _add_promotion_features(out)
 
-    # Steps 7–9 — sales-derived features; only available on train-like data
+    # Steps 7–11 — context signals, Fourier seasonality, target encoding
+    out = _add_transactions_features(out, transactions)
+    out = _add_earthquake_feature(out)
+    out = _add_fourier_features(out, period=7.0, n_terms=3, prefix="weekly")
+    out = _add_fourier_features(out, period=365.25, n_terms=6, prefix="annual")
+    out = _add_target_encoding(out, train_df)
+
+    # Steps 12–14 — sales-derived features; only available on train-like data
     if "sales" in out.columns:
         out["sales"] = np.log1p(out["sales"])
         out = _add_lag_features(out)
