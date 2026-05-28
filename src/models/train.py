@@ -47,46 +47,47 @@ _LAG_COLS: List[str] = [
 ]
 
 LGBM_PARAMS: Dict = {
-    "objective":         "regression_l2",
-    "metric":            "rmse",
-    "num_leaves":        127,
-    "learning_rate":     0.05,
-    "feature_fraction":  0.8,
-    "bagging_fraction":  0.8,
-    "bagging_freq":      5,
-    "min_child_samples": 20,
-    "n_estimators":      3_000,
-    "random_state":      42,
-    "n_jobs":            -1,
-    "verbose":           -1,
+    "objective":              "tweedie",
+    "metric":                 "tweedie",
+    "tweedie_variance_power": 1.5,
+    "num_leaves":             127,
+    "learning_rate":          0.05,
+    "feature_fraction":       0.8,
+    "bagging_fraction":       0.8,
+    "bagging_freq":           5,
+    "min_child_samples":      20,
+    "n_estimators":           3_000,
+    "random_state":           42,
+    "n_jobs":                 -1,
+    "verbose":                -1,
 }
 
 MLFLOW_EXPERIMENT: str = "store-sales-forecasting"
-MODEL_FILENAME:    str = "lgbm_v3.joblib"
+MODEL_FILENAME:    str = "lgbm_v4_tweedie.joblib"
 _HORIZON_N:        int = 16
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def compute_rmsle(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute RMSLE between ground-truth and predicted values.
+    """Compute true RMSLE between ground-truth and predicted values.
 
-    Because both arrays are already in log1p space — ``build_features``
-    applies ``log1p`` to the sales target — RMSLE collapses to plain RMSE:
+    Both arrays must be in **original (raw) scale** — i.e. the Tweedie model
+    outputs directly.  The function applies ``log1p`` internally:
 
     .. math::
 
-        \\text{RMSLE} = \\sqrt{\\frac{1}{n} \\sum_i (\\hat{y}_i - y_i)^2}
+        \\text{RMSLE} = \\sqrt{\\frac{1}{n}
+            \\sum_i \\bigl(\\log(1+\\hat{y}_i) - \\log(1+y_i)\\bigr)^2}
 
-    where :math:`y_i = \\log(1 + \\text{sales}_i)`.
+    Negative predictions are clipped to 0 before scoring.
 
     Parameters
     ----------
     y_true : np.ndarray
-        Ground-truth values in log1p space.
+        Ground-truth values in original scale (non-negative).
     y_pred : np.ndarray
-        Predicted values in log1p space. Clipped to 0 before scoring to
-        avoid negative-prediction artefacts.
+        Predicted values in original scale. Clipped to 0 before scoring.
 
     Returns
     -------
@@ -94,7 +95,7 @@ def compute_rmsle(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         RMSLE score (lower is better).
     """
     y_pred = np.maximum(y_pred, 0.0)
-    return float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+    return float(np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2)))
 
 
 def load_and_build_features() -> pd.DataFrame:
@@ -108,10 +109,14 @@ def load_and_build_features() -> pd.DataFrame:
     target-encoding means are derived exclusively from the training window,
     preventing any leakage from the validation period.
 
+    ``apply_log1p=False`` is passed to ``build_features`` so that the ``sales``
+    target and all lag / rolling features are kept in original scale, matching
+    the Tweedie objective which operates directly on raw sales.
+
     Returns
     -------
     pd.DataFrame
-        Feature matrix with the ``sales`` column in log1p space.
+        Feature matrix with the ``sales`` column in original scale.
         Warmup rows are excluded; index is reset.
     """
     print("Loading raw data …")
@@ -129,6 +134,7 @@ def load_and_build_features() -> pd.DataFrame:
         holidays     = data["holidays"],
         transactions = data["transactions"],
         train_df     = raw_train,
+        apply_log1p  = False,
     )
 
     n_before = len(feat)
@@ -331,6 +337,7 @@ def train_full(best_iteration: int) -> lgb.LGBMRegressor:
         holidays     = data["holidays"],
         transactions = data["transactions"],
         train_df     = data["train"],
+        apply_log1p  = False,
     )
 
     n_before = len(feat)
@@ -353,7 +360,7 @@ def train_full(best_iteration: int) -> lgb.LGBMRegressor:
     model.fit(X, y, callbacks=[lgb.log_evaluation(period=100)])
 
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
-    with mlflow.start_run(run_name="lgbm_v3_full_train"):
+    with mlflow.start_run(run_name="lgbm_v4_tweedie_full"):
         mlflow.log_params({
             **params,
             "n_features":     len(feature_cols),
@@ -362,7 +369,7 @@ def train_full(best_iteration: int) -> lgb.LGBMRegressor:
         mlflow.sklearn.log_model(model, artifact_path="model")
         print(f"\nMLflow run_id : {mlflow.active_run().info.run_id}")
 
-    model_path = MODELS_DIR / "lgbm_v3_full.joblib"
+    model_path = MODELS_DIR / "lgbm_v4_tweedie_full.joblib"
     joblib.dump(model, model_path)
     print(f"Model saved   : {model_path}")
 
@@ -487,24 +494,166 @@ def train_horizon_models() -> None:
     print(f"  Mean  : {mean_rmsle:.6f}")
 
 
+def train_horizon_models_v2() -> None:
+    """Train 16 feature-aligned direct multi-step models, one per forecast horizon.
+
+    Extends ``train_horizon_models()`` with two fixes:
+
+    1. **Lag/rolling alignment** — for horizon h, every lag and rolling feature
+       column is shifted forward by an additional h positions within each
+       (store_nbr, family) group before training.  This makes the training
+       samples geometrically equivalent to the inference snapshot: at inference
+       ``sales_lag_7`` at Aug 15 = Aug 8 = target − 14; the shifted training
+       rows carry the same 14-day gap between the lag value and the target.
+
+    2. **Recency window** — training is limited to 2016-08-01 onward (≈ 365
+       days).  Recent seasonal patterns generalise better to the Aug 2017 test
+       period than the full 4-year history.
+
+    Models are saved to ``models/horizon_v2/lgbm_h{h}.joblib`` and logged to
+    MLflow under run names ``lgbm_horizon_v2_{h}`` with tag
+    ``run_group=lgbm_horizon_v2_models``.
+
+    Returns
+    -------
+    None
+    """
+    _TRAIN_START = pd.Timestamp("2016-08-01")
+    horizon_v2_dir = MODELS_DIR / "horizon_v2"
+    horizon_v2_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Loading raw data …")
+    data = load_raw_data()
+
+    te_cutoff = data["train"]["date"].max() - pd.Timedelta(days=VAL_DAYS - 1)
+    raw_train = data["train"].loc[data["train"]["date"] < te_cutoff]
+
+    print("\nBuilding features (horizon_v2 models) …")
+    feat = build_features(
+        df           = data["train"],
+        stores       = data["stores"],
+        oil          = data["oil"],
+        holidays     = data["holidays"],
+        transactions = data["transactions"],
+        train_df     = raw_train,
+    )
+    n_before = len(feat)
+    feat = feat.dropna(subset=_LAG_COLS).reset_index(drop=True)
+    print(
+        f"Dropped {n_before - len(feat):,} warmup rows → {len(feat):,} remain\n"
+        f"Feature window : {feat['date'].min().date()} → {feat['date'].max().date()}"
+    )
+
+    feature_cols = get_feature_columns(feat)
+    shiftable_cols = [c for c in feature_cols if "_lag_" in c or "_roll_" in c]
+    print(f"Shiftable columns ({len(shiftable_cols)}): {shiftable_cols}")
+
+    rmsle_scores: List[float] = []
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+    for h in range(1, _HORIZON_N + 1):
+        print(f"\n── h={h:2d}/{_HORIZON_N} " + "─" * 38)
+
+        # Target: log1p(sales at t+h) per (store, family)
+        target_h = (
+            feat.groupby(["store_nbr", "family"], sort=False)["sales"].shift(-h)
+        )
+
+        # Shift every lag/rolling column forward by h more positions so that,
+        # at training row t, each lag reflects data from t-h-lag_size rather
+        # than t-lag_size — matching the inference snapshot geometry.
+        shifted: Dict[str, pd.Series] = {
+            col: feat.groupby(["store_nbr", "family"], sort=False)[col].shift(h)
+            for col in shiftable_cols
+        }
+
+        # A row is usable only when target AND all shifted feature columns are
+        # non-NaN (extra warmup from the additional h-step shift is dropped).
+        valid = target_h.notna()
+        for s in shifted.values():
+            valid &= s.notna()
+
+        max_usable = feat.loc[valid, "date"].max()
+        val_cutoff = max_usable - pd.Timedelta(days=VAL_DAYS - 1)
+
+        train_mask = valid & (feat["date"] >= _TRAIN_START) & (feat["date"] < val_cutoff)
+        val_mask   = valid & (feat["date"] >= val_cutoff)
+
+        print(
+            f"  train: {feat.loc[train_mask, 'date'].min().date()}"
+            f" → {feat.loc[train_mask, 'date'].max().date()}"
+            f"  ({train_mask.sum():,} rows)"
+            f"\n  val  : {feat.loc[val_mask, 'date'].min().date()}"
+            f" → {feat.loc[val_mask, 'date'].max().date()}"
+            f"  ({val_mask.sum():,} rows)"
+        )
+
+        # Build feature matrices with shifted lag/rolling columns substituted in
+        X_train = feat.loc[train_mask, feature_cols].copy()
+        for col, s in shifted.items():
+            X_train[col] = s.loc[train_mask]
+        X_train = _cast_categoricals(X_train)
+        y_train = target_h.loc[train_mask].values
+
+        X_val = feat.loc[val_mask, feature_cols].copy()
+        for col, s in shifted.items():
+            X_val[col] = s.loc[val_mask]
+        X_val = _cast_categoricals(X_val)
+        y_val = target_h.loc[val_mask].values
+
+        model = lgb.LGBMRegressor(**LGBM_PARAMS)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(period=500),
+            ],
+        )
+
+        rmsle = compute_rmsle(y_val, model.predict(X_val))
+        rmsle_scores.append(rmsle)
+        print(f"  RMSLE: {rmsle:.6f}  best_iter: {model.best_iteration_}")
+
+        with mlflow.start_run(run_name=f"lgbm_horizon_v2_{h}"):
+            mlflow.set_tag("run_group", "lgbm_horizon_v2_models")
+            mlflow.log_params({
+                **LGBM_PARAMS,
+                "horizon":        h,
+                "n_features":     len(feature_cols),
+                "best_iteration": model.best_iteration_,
+                "train_start":    str(_TRAIN_START.date()),
+            })
+            mlflow.log_metric("rmsle_val", rmsle)
+            mlflow.sklearn.log_model(model, artifact_path="model")
+
+        model_path = horizon_v2_dir / f"lgbm_h{h}.joblib"
+        joblib.dump(model, model_path)
+
+    mean_rmsle = float(np.mean(rmsle_scores))
+    print(f"\n{'═' * 50}")
+    print("Horizon v2 RMSLE per h:")
+    for h, r in enumerate(rmsle_scores, 1):
+        print(f"  h={h:2d} : {r:.6f}")
+    print(f"  Mean  : {mean_rmsle:.6f}")
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run the full LightGBM training pipeline.
+    """Run the Tweedie LightGBM training pipeline (v4).
 
     Steps
     -----
-    1. Load raw data and engineer features.
+    1. Load raw data and engineer features (raw sales scale, no log1p).
     2. Drop warmup rows (NaN lag features).
     3. Temporal train / validation split (last 15 days).
-    4. Train LightGBM with early stopping.
-    5. Evaluate RMSLE on the validation set.
-    6. Log parameters, metrics, and model artifact to MLflow.
-    7. Persist the model to ``models/lgbm_v3.joblib``.
+    4. Train LightGBM with Tweedie objective and early stopping.
+    5. Evaluate true RMSLE on the validation set.
+    6. Log parameters and metrics to MLflow (run: ``lgbm_v4_tweedie``).
+    7. Persist the model to ``models/lgbm_v4_tweedie.joblib``.
     8. Retrain on the full dataset using ``best_iteration_`` as the fixed
-       tree count; persist to ``models/lgbm_v3_full.joblib``.
-    9. Train 16 direct multi-step horizon models (h=1..16), each saved to
-       ``models/horizon/lgbm_h{h}.joblib``.
+       tree count; persist to ``models/lgbm_v4_tweedie_full.joblib``.
     """
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -520,7 +669,7 @@ def main() -> None:
     # ── 4–5. Train and evaluate ────────────────────────────────────────────
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name="lgbm_v3_target_encoding"):
+    with mlflow.start_run(run_name="lgbm_v4_tweedie"):
 
         model = train_model(train_df, val_df, feature_cols)
         rmsle_val = evaluate(model, val_df, feature_cols)
@@ -548,11 +697,6 @@ def main() -> None:
     print(f"\n{'═' * 60}")
     print("Retraining on full dataset …")
     train_full(best_iteration=model.best_iteration_)
-
-    # ── 9. Direct multi-step horizon models ────────────────────────────────
-    print(f"\n{'═' * 60}")
-    print("Training direct multi-step horizon models (h=1..16) …")
-    train_horizon_models()
 
 
 if __name__ == "__main__":

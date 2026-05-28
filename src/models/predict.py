@@ -44,8 +44,8 @@ from src.features.engineering import build_features
 MODELS_DIR:    Path = PROJECT_ROOT / "models"
 PROCESSED_DIR: Path = PROJECT_ROOT / "data" / "processed"
 
-_MODEL_FILE:      str = "lgbm_v3_full.joblib"
-_SUBMISSION_FILE: str = "submission_v6.csv"
+_MODEL_FILE:      str = "lgbm_v4_tweedie_full.joblib"
+_SUBMISSION_FILE: str = "submission_v8.csv"
 _HORIZON_N:       int = 16
 _CONTEXT_DAYS:    int = 30
 _TX_LOOKBACK:     int = 7    # days used for per-store transaction proxy
@@ -327,15 +327,18 @@ def predict_iterative(
             holidays=holidays,
             transactions=transactions_aug,
             train_df=train,
+            apply_log1p=False,
         )
 
         # Extract and correct features for the current test date
         test_feat_d = feat[feat["date"] == d].copy()
         test_feat_d = _recompute_fourier_features(test_feat_d, ref_date)
 
-        X_d        = _cast_categoricals(test_feat_d[feature_cols].copy())
-        preds_log1p = model.predict(X_d)
-        preds_raw   = np.expm1(preds_log1p).clip(min=0.0)
+        X_d       = _cast_categoricals(test_feat_d[feature_cols].copy())
+        preds_raw = model.predict(X_d).clip(min=0.0)  # Tweedie: already raw scale
+
+        # Convert to log1p for blending and logging only — not for submission.
+        preds_log1p = np.log1p(preds_raw)
 
         # Blend predicted log1p with store-family real-data rolling mean.
         # NaN fallback: use raw prediction for any (store, family) not in sfm.
@@ -382,6 +385,7 @@ def predict_horizon(
     holidays: pd.DataFrame,
     transactions_aug: pd.DataFrame,
     feature_cols: List[str],
+    horizon_dir: Path = None,
 ) -> pd.DataFrame:
     """Predict all 16 test dates using direct multi-step horizon models.
 
@@ -398,7 +402,7 @@ def predict_horizon(
        (store_nbr, family) — carrying correct lag_7/14/28 and rolling
        stats from real data.
     4. For each horizon h (1 … 16):
-       - Load ``models/horizon/lgbm_h{h}.joblib``.
+       - Load ``{horizon_dir}/lgbm_h{h}.joblib``.
        - Apply model to the Aug-15 snapshot.
        - Look up test-row ids for the target date (Aug 15 + h days).
 
@@ -420,6 +424,9 @@ def predict_horizon(
         synthetic constant-mean rows for all test dates).
     feature_cols : List[str]
         Ordered feature column list shared by all 16 horizon models.
+    horizon_dir : Path, optional
+        Directory containing ``lgbm_h{h}.joblib`` model files.
+        Defaults to ``models/horizon``.
 
     Returns
     -------
@@ -427,7 +434,8 @@ def predict_horizon(
         Submission DataFrame with columns ``id`` and ``sales`` (original
         scale, clipped >= 0), sorted by ``id``.
     """
-    horizon_dir = MODELS_DIR / "horizon"
+    if horizon_dir is None:
+        horizon_dir = MODELS_DIR / "horizon"
     ref_date    = train["date"].min()
     last_date   = train["date"].max()       # 2017-08-15
     test_dates  = sorted(test["date"].unique())
@@ -481,17 +489,19 @@ def predict_horizon(
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run the v6 prediction pipeline and write submission_v6.csv.
+    """Run the v8 Tweedie prediction pipeline and write submission_v8.csv.
 
     Steps
     -----
     1. Load all raw datasets via ``load_raw_data()``.
     2. Augment the transactions table with per-store synthetic rows for all
        test dates.
-    3. Load feature column list from ``models/horizon/lgbm_h1.joblib``.
-    4. Predict using 16 direct multi-step horizon models — one per test
-       date, no iterative feedback.
-    5. Save ``id, sales`` CSV to ``data/processed/submission_v6.csv``.
+    3. Load ``models/lgbm_v4_tweedie_full.joblib`` and its feature column list.
+    4. Predict iteratively across the 16 test dates with smoothed lag feedback.
+       Features are built in raw (original) scale — no log1p transform —
+       matching the Tweedie training configuration.  Model output is already
+       in original units; no ``expm1`` reversal is applied.
+    5. Save ``id, sales`` CSV to ``data/processed/submission_v8.csv``.
     6. Print a prediction summary: rows, nulls, negatives, min/max/mean,
        and output path.
     """
@@ -508,20 +518,18 @@ def main() -> None:
         f"  Augmented rows: {len(transactions_aug):,}"
     )
 
-    # Borrow feature column list from h=1 model (all horizon models share it)
-    horizon_dir = MODELS_DIR / "horizon"
-    _tmp = joblib.load(horizon_dir / "lgbm_h1.joblib")
-    feature_cols: List[str] = _tmp.feature_name_
-    del _tmp
+    model = joblib.load(MODELS_DIR / _MODEL_FILE)
+    feature_cols: List[str] = model.feature_name_
 
-    print("\nDirect multi-step horizon prediction (16 models) …")
-    submission = predict_horizon(
+    print("\nIterative daily prediction (16 days, Tweedie) …")
+    submission = predict_iterative(
         test=data["test"],
         train=data["train"],
         stores=data["stores"],
         oil=data["oil"],
         holidays=data["holidays"],
         transactions_aug=transactions_aug,
+        model=model,
         feature_cols=feature_cols,
     )
 

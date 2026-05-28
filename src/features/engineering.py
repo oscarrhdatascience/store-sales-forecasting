@@ -400,6 +400,7 @@ def build_features(
     holidays: pd.DataFrame,
     transactions: pd.DataFrame | None = None,
     train_df: pd.DataFrame | None = None,
+    apply_log1p: bool = True,
 ) -> pd.DataFrame:
     """Build the full feature matrix for training or inference.
 
@@ -418,13 +419,16 @@ def build_features(
     10. Annual Fourier terms (period=365.25, n_terms=6).
     11. Target encoding — mean log1p(sales) per family, store, and
         (store, family) derived from *train_df* only (skipped when None).
-    12. log1p transform on ``sales`` (when present).
-    13. Lag features on log1p(sales): t-7, t-14, t-28.
-    14. Rolling mean and std on log1p(sales): 7-, 14-, 28-day windows.
+    12. Optional log1p transform on ``sales`` (controlled by *apply_log1p*).
+    13. Lag features on ``sales``: t-7, t-14, t-28.
+    14. Rolling mean and std on ``sales``: 7-, 14-, 28-day windows.
 
-    Log1p is applied before lags and rolling stats so that all sales-derived
-    features share the same scale as the target, which is appropriate for a
-    model optimised on RMSLE.
+    When *apply_log1p* is ``True`` (default), log1p is applied before lags and
+    rolling stats so all sales-derived features share the same scale as the
+    log1p target — appropriate for RMSE-on-log1p optimisation.  Set
+    *apply_log1p* to ``False`` when using objectives that operate on the
+    original scale (e.g. Tweedie), so that lag and rolling features are also
+    in original units.
 
     Parameters
     ----------
@@ -446,13 +450,19 @@ def build_features(
         scale) used exclusively to compute target-encoding means. Must cover
         only the training window (no validation or test rows) to prevent
         leakage. When None (default), target encoding is skipped.
+    apply_log1p : bool, optional
+        Whether to apply ``log1p`` to the ``sales`` column before computing
+        lag and rolling features. Default ``True`` (log1p space, RMSE
+        optimisation). Pass ``False`` for Tweedie or other objectives that
+        train directly on original-scale sales.
 
     Returns
     -------
     pd.DataFrame
         Feature matrix sorted by (store_nbr, family, date) with all engineered
         columns appended. The ``sales`` column — when present — is returned in
-        log1p space. NaN values in lag / rolling columns are expected for the
+        log1p space when *apply_log1p* is ``True``, or in original scale when
+        ``False``. NaN values in lag / rolling columns are expected for the
         earliest dates in each series and must be handled downstream
         (e.g. dropped during training or imputed).
 
@@ -492,7 +502,8 @@ def build_features(
 
     # Steps 12–14 — sales-derived features; only available on train-like data
     if "sales" in out.columns:
-        out["sales"] = np.log1p(out["sales"])
+        if apply_log1p:
+            out["sales"] = np.log1p(out["sales"])
         out = _add_lag_features(out)
         out = _add_rolling_features(out)
 
