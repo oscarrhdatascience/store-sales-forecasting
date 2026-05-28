@@ -1,17 +1,23 @@
-"""Generate Kaggle submission (v4) using iterative daily prediction.
+"""Generate Kaggle submission (v5) with full-data model and smoothed lag feedback.
 
-Two bugs from the v3 submission (score 2.70699) are fixed:
+Two improvements over v4 (Kaggle score 0.409):
 
-Bug 1 — 100% NaN transactions at test time.
-    ``transactions.csv`` ends 2017-08-15, so every test row had NaN for the
-    three transaction features.  Fix: for each store, compute the last-7-day
-    mean and use it as a constant forward-fill proxy across all 16 test dates.
+Fix 1 — Full-data model.
+    ``lgbm_v3_full.joblib`` is trained on the entire 2013-01-29 to 2017-08-15
+    window using ``best_iteration_`` from the early-stopping run as the fixed
+    tree count.  Every training row (including the Aug 1-15 validation window
+    previously held out) now contributes to the fitted trees.
 
-Bug 2 — NaN lag/rolling features for test days 8-16.
-    With the 30-day context window, test day 8 (2017-08-23) needs lag_7 from
-    2017-08-16 — a test date with no actual sales.  Fix: predict one calendar
-    day at a time and feed each day's predicted sales (raw scale) back into
-    the context so subsequent days compute correct lag and rolling features.
+Fix 2 — Smoothed predicted-lag feedback.
+    When a predicted day is appended to the rolling context, its stored sales
+    value is blended 50/50 between the raw predicted log1p and the per-
+    (store, family) 7-day trailing mean log1p computed once from the original
+    real training context.  This reduces the variance of ``sales_lag_7`` for
+    test days 8-16, narrowing the covariance gap between the point lag and the
+    smoothed rolling features that the model saw during training.
+
+    The final submitted predictions are still the unblended model outputs;
+    blending only affects what is stored as context for subsequent lag inputs.
 
 Run from the project root::
 
@@ -38,8 +44,9 @@ from src.features.engineering import build_features
 MODELS_DIR:    Path = PROJECT_ROOT / "models"
 PROCESSED_DIR: Path = PROJECT_ROOT / "data" / "processed"
 
-_MODEL_FILE:      str = "lgbm_v3.joblib"
-_SUBMISSION_FILE: str = "submission_v4.csv"
+_MODEL_FILE:      str = "lgbm_v3_full.joblib"
+_SUBMISSION_FILE: str = "submission_v6.csv"
+_HORIZON_N:       int = 16
 _CONTEXT_DAYS:    int = 30
 _TX_LOOKBACK:     int = 7    # days used for per-store transaction proxy
 
@@ -197,6 +204,45 @@ def _augment_transactions(
     )
 
 
+def _build_store_family_roll_mean(
+    context: pd.DataFrame,
+    window: int = 7,
+) -> pd.DataFrame:
+    """Compute per-(store_nbr, family) trailing mean log1p sales from context.
+
+    Called once before the iterative prediction loop using the initial real
+    training context (no predicted rows).  The resulting baseline is used to
+    blend predicted sales stored back into the context, reducing the variance
+    of ``sales_lag_7`` for test days 8-16 relative to the smoothed rolling
+    features.
+
+    Parameters
+    ----------
+    context : pd.DataFrame
+        Context window DataFrame (real training rows) with columns
+        ``store_nbr``, ``family``, ``date``, and ``sales`` (raw scale).
+    window : int, optional
+        Number of trailing days to average per group. Default: 7.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (store_nbr, family) pair with columns ``store_nbr``,
+        ``family``, and ``sfm_log1p`` — the trailing-window mean of log1p
+        sales used as the smoothing target in the 50/50 blend.
+    """
+    ctx = context[["store_nbr", "family", "date", "sales"]].copy()
+    ctx["sales_log1p"] = np.log1p(ctx["sales"].clip(lower=0))
+    ctx = ctx.sort_values(["store_nbr", "family", "date"])
+    sfm = (
+        ctx.groupby(["store_nbr", "family"])["sales_log1p"]
+        .apply(lambda s: s.tail(window).mean())
+        .reset_index()
+        .rename(columns={"sales_log1p": "sfm_log1p"})
+    )
+    return sfm
+
+
 def predict_iterative(
     test: pd.DataFrame,
     train: pd.DataFrame,
@@ -207,22 +253,22 @@ def predict_iterative(
     model: Any,
     feature_cols: List[str],
 ) -> pd.DataFrame:
-    """Predict one test date at a time, feeding predictions back as lag inputs.
+    """Predict one test date at a time, feeding smoothed predictions back as lags.
 
     Each of the 16 calendar days in the test period is processed sequentially:
 
     1. Append the day's test rows (``sales=NaN`` placeholder) to the running
-       context (30 training days + all previously predicted days with raw-scale
-       predicted sales).
-    2. Call ``build_features()`` — ``_add_lag_features`` and
-       ``_add_rolling_features`` look into the context and find log1p of the
-       predicted sales for already-processed days, eliminating the NaN lag
-       cascade that caused 56-62% NaN on test days 8-16.
+       context (30 training days + all previously predicted days).
+    2. Call ``build_features()`` — lag and rolling features look into the
+       context and find log1p of the stored sales, eliminating the NaN cascade
+       for test days 8-16.
     3. Recompute Fourier columns against the training reference date
-       (2013-01-01) to correct the phase shift introduced by the context
-       window's ``date.min()`` anchor.
-    4. Predict in log1p space, clip to >= 0 after expm1, then append raw-scale
-       predictions to the context so the next iteration's lags are correct.
+       (2013-01-01) to correct the phase shift from the context window anchor.
+    4. Predict in log1p space, clip to >= 0 after expm1.
+    5. Store a *blended* sales value in the context — 50% raw prediction and
+       50% per-(store, family) 7-day trailing mean from the original real
+       training context.  Submitted predictions are always the unblended
+       model outputs; blending only smooths the lag inputs for subsequent days.
 
     Note: the ``id``-to-prediction mapping uses ``test_feat_d["id"]``
     (sorted by store_nbr, family as ``build_features`` requires) rather than
@@ -260,6 +306,10 @@ def predict_iterative(
     ref_date   = train["date"].min()
     n = len(test_dates)
 
+    # Compute per-(store, family) 7-day trailing mean log1p from real context
+    # once before the loop — used as the smooth target in the 50/50 blend.
+    sfm = _build_store_family_roll_mean(context)
+
     records: List[pd.DataFrame] = []
 
     for i, d in enumerate(test_dates):
@@ -287,24 +337,139 @@ def predict_iterative(
         preds_log1p = model.predict(X_d)
         preds_raw   = np.expm1(preds_log1p).clip(min=0.0)
 
+        # Blend predicted log1p with store-family real-data rolling mean.
+        # NaN fallback: use raw prediction for any (store, family) not in sfm.
+        sfm_vals = (
+            test_feat_d[["store_nbr", "family"]]
+            .merge(sfm, on=["store_nbr", "family"], how="left")["sfm_log1p"]
+            .to_numpy()
+        )
+        sfm_vals = np.where(np.isnan(sfm_vals), preds_log1p, sfm_vals)
+        blended_log1p = 0.5 * preds_log1p + 0.5 * sfm_vals
+
         print(
-            f"log1p mean = {preds_log1p.mean():.3f}  |  "
+            f"log1p mean = {preds_log1p.mean():.3f} "
+            f"(blend={blended_log1p.mean():.3f})  |  "
             f"sales mean = {preds_raw.mean():.1f}"
         )
 
-        # Collect submission rows — ids come from test_feat_d (sorted order)
+        # Collect submission rows — unblended predictions, ids from sorted order
         records.append(
             pd.DataFrame({"id": test_feat_d["id"].values, "sales": preds_raw})
         )
 
-        # Append raw-scale predictions to context for the next day's lags.
-        # build_features() will apply log1p internally, so log1p(expm1(pred))
-        # = pred — the lag values for subsequent days are exact.
+        # Store blended raw-scale value in context so lag_7 for subsequent
+        # days is smoothed.  build_features() applies log1p internally, so
+        # storing expm1(blended_log1p) yields blended_log1p as the lag input.
         predicted_context_rows = test_feat_d[
             ["id", "date", "store_nbr", "family", "onpromotion"]
         ].copy()
-        predicted_context_rows["sales"] = np.expm1(preds_log1p)
+        predicted_context_rows["sales"] = np.expm1(blended_log1p)
         context = pd.concat([context, predicted_context_rows], ignore_index=True)
+
+    return (
+        pd.concat(records, ignore_index=True)
+        .sort_values("id")
+        .reset_index(drop=True)
+    )
+
+
+def predict_horizon(
+    test: pd.DataFrame,
+    train: pd.DataFrame,
+    stores: pd.DataFrame,
+    oil: pd.DataFrame,
+    holidays: pd.DataFrame,
+    transactions_aug: pd.DataFrame,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    """Predict all 16 test dates using direct multi-step horizon models.
+
+    Each horizon model h was trained to predict log1p(sales at t+h) using
+    only features available at time t.  At inference, t is fixed to the
+    last real observation date (2017-08-15): lag and rolling features come
+    entirely from real training data, with no predicted values fed back.
+
+    Steps
+    -----
+    1. Build features on the 30-day real context window (Jul 17 – Aug 15).
+    2. Correct Fourier phase against the 2013-01-01 training origin.
+    3. Extract the 1 782 feature rows at 2017-08-15 — one per
+       (store_nbr, family) — carrying correct lag_7/14/28 and rolling
+       stats from real data.
+    4. For each horizon h (1 … 16):
+       - Load ``models/horizon/lgbm_h{h}.joblib``.
+       - Apply model to the Aug-15 snapshot.
+       - Look up test-row ids for the target date (Aug 15 + h days).
+
+    Parameters
+    ----------
+    test : pd.DataFrame
+        Raw test DataFrame (id, date, store_nbr, family, onpromotion).
+    train : pd.DataFrame
+        Full raw training DataFrame — context window source and target-
+        encoding reference.
+    stores : pd.DataFrame
+        Store metadata table.
+    oil : pd.DataFrame
+        Oil price table with forward-filled values.
+    holidays : pd.DataFrame
+        Holidays and events table.
+    transactions_aug : pd.DataFrame
+        Augmented transactions table (real rows up to 2017-08-15 plus
+        synthetic constant-mean rows for all test dates).
+    feature_cols : List[str]
+        Ordered feature column list shared by all 16 horizon models.
+
+    Returns
+    -------
+    pd.DataFrame
+        Submission DataFrame with columns ``id`` and ``sales`` (original
+        scale, clipped >= 0), sorted by ``id``.
+    """
+    horizon_dir = MODELS_DIR / "horizon"
+    ref_date    = train["date"].min()
+    last_date   = train["date"].max()       # 2017-08-15
+    test_dates  = sorted(test["date"].unique())
+    n           = len(test_dates)
+
+    # Build features on the 30-day real context (lags are all from real data)
+    context = _build_context_window(train)
+    feat = build_features(
+        df           = context,
+        stores       = stores,
+        oil          = oil,
+        holidays     = holidays,
+        transactions = transactions_aug,
+        train_df     = train,
+    )
+    feat = _recompute_fourier_features(feat, ref_date)
+
+    # One row per (store_nbr, family) at the last real date
+    base_feat = feat[feat["date"] == last_date].copy()
+    print(f"  Base snapshot : {last_date.date()}  ({len(base_feat)} rows)")
+
+    records: List[pd.DataFrame] = []
+
+    for h, d in enumerate(test_dates, 1):
+        model = joblib.load(horizon_dir / f"lgbm_h{h}.joblib")
+
+        X           = _cast_categoricals(base_feat[feature_cols].copy())
+        preds_log1p = model.predict(X)
+        preds_raw   = np.expm1(preds_log1p).clip(min=0.0)
+
+        print(
+            f"  h={h:2d}/{n} ({d.date()}) : "
+            f"log1p mean = {preds_log1p.mean():.3f}  |  "
+            f"sales mean = {preds_raw.mean():.1f}"
+        )
+
+        # Match predictions to test ids for this target date
+        test_d      = test[test["date"] == d][["id", "store_nbr", "family"]].copy()
+        pred_lookup = base_feat[["store_nbr", "family"]].copy()
+        pred_lookup["sales"] = preds_raw
+        merged = test_d.merge(pred_lookup, on=["store_nbr", "family"], how="left")
+        records.append(merged[["id", "sales"]])
 
     return (
         pd.concat(records, ignore_index=True)
@@ -316,18 +481,17 @@ def predict_iterative(
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run the fixed prediction pipeline and write submission_v4.csv.
+    """Run the v6 prediction pipeline and write submission_v6.csv.
 
     Steps
     -----
     1. Load all raw datasets via ``load_raw_data()``.
-    2. Load ``lgbm_v3.joblib`` from the models directory.
-    3. Augment the transactions table with per-store synthetic rows for all
-       test dates (fixes Bug 1 — 100% NaN transactions).
-    4. Predict iteratively one calendar day at a time, feeding each day's
-       predictions back into the context window (fixes Bug 2 — NaN lag and
-       rolling features for test days 8-16).
-    5. Save ``id, sales`` CSV to ``data/processed/submission_v4.csv``.
+    2. Augment the transactions table with per-store synthetic rows for all
+       test dates.
+    3. Load feature column list from ``models/horizon/lgbm_h1.joblib``.
+    4. Predict using 16 direct multi-step horizon models — one per test
+       date, no iterative feedback.
+    5. Save ``id, sales`` CSV to ``data/processed/submission_v6.csv``.
     6. Print a prediction summary: rows, nulls, negatives, min/max/mean,
        and output path.
     """
@@ -335,11 +499,6 @@ def main() -> None:
 
     print("Loading data …")
     data = load_raw_data()
-
-    model_path = MODELS_DIR / _MODEL_FILE
-    print(f"\nLoading model : {model_path}")
-    model = joblib.load(model_path)
-    feature_cols: List[str] = model.feature_name_
 
     print("\nAugmenting transactions for test period …")
     test_dates_unique = data["test"]["date"].unique()
@@ -349,15 +508,20 @@ def main() -> None:
         f"  Augmented rows: {len(transactions_aug):,}"
     )
 
-    print("\nIterative daily prediction (16 days) …")
-    submission = predict_iterative(
+    # Borrow feature column list from h=1 model (all horizon models share it)
+    horizon_dir = MODELS_DIR / "horizon"
+    _tmp = joblib.load(horizon_dir / "lgbm_h1.joblib")
+    feature_cols: List[str] = _tmp.feature_name_
+    del _tmp
+
+    print("\nDirect multi-step horizon prediction (16 models) …")
+    submission = predict_horizon(
         test=data["test"],
         train=data["train"],
         stores=data["stores"],
         oil=data["oil"],
         holidays=data["holidays"],
         transactions_aug=transactions_aug,
-        model=model,
         feature_cols=feature_cols,
     )
 
